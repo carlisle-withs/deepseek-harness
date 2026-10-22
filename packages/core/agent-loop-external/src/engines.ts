@@ -9,6 +9,9 @@
  * Per-engine env overrides: `ENGINE_LOOP_<PREFIX>_COMMAND`, `_ARGS`, and
  * `_MODEL` (prefixes: CLAUDE, OPENCODE, PI). `ENGINE_LOOP_ENGINE` sets the
  * engine used before any selection, for headless runs and default routing.
+ * The session's durable sandbox mode maps to each engine's permission flags
+ * ({@link engineConfigForSession}); an explicit `_ARGS` override replaces
+ * that derivation entirely.
  *
  * @module dsh-agent-loop-external/engines
  */
@@ -33,8 +36,13 @@ interface EngineDescriptor {
   readonly command: string
   /** Env prefix for this engine's overrides (`ENGINE_LOOP_<PREFIX>_…`). */
   readonly envPrefix: string
-  /** Default extra args appended to the engine's fixed flags. */
-  readonly defaultArgs: string
+  /**
+   * Permission flags per dsh sandbox mode, replacing the engine's own default
+   * permission behavior. One-shot children cannot ask, so the approval knob
+   * has no mapping: `ask` collapses into each mode's least-privilege flags.
+   * An omitted mode (pi) keeps the engine's own configuration.
+   */
+  readonly permissionArgs: Partial<Record<SandboxModeLike, readonly string[]>>
   /** Build one live engine child. */
   readonly createTurn: (
     config: EngineHarnessConfig,
@@ -43,6 +51,12 @@ interface EngineDescriptor {
   ) => { start(prompt: string, resumeSessionId: string | null): Promise<EngineTurnOutcome>; stop(): void }
 }
 
+/**
+ * The dsh sandbox mode engines treat as their default when the session never
+ * overrode the permission knobs (the composition default preset).
+ */
+const DEFAULT_SANDBOX: SandboxModeLike = 'workspace-write'
+
 /** The engines this loop drives, in picker order. */
 export const ENGINES: readonly EngineDescriptor[] = [
   {
@@ -50,7 +64,13 @@ export const ENGINES: readonly EngineDescriptor[] = [
     name: 'Claude Code',
     command: 'claude',
     envPrefix: 'CLAUDE',
-    defaultArgs: '--permission-mode acceptEdits',
+    permissionArgs: {
+      'danger-full-access': ['--permission-mode', 'bypassPermissions'],
+      'workspace-write': ['--permission-mode', 'acceptEdits'],
+      // default mode auto-denies unapproved write/exec tools in -p runs,
+      // which is the closest one-shot equivalent of read-only.
+      'read-only': ['--permission-mode', 'default'],
+    },
     createTurn: (config, cwd, events) => new ClaudeCodeTurn(config, cwd, events),
   },
   {
@@ -58,7 +78,12 @@ export const ENGINES: readonly EngineDescriptor[] = [
     name: 'OpenCode',
     command: 'opencode',
     envPrefix: 'OPENCODE',
-    defaultArgs: '--auto',
+    permissionArgs: {
+      'danger-full-access': ['--auto'],
+      'workspace-write': ['--auto'],
+      // without --auto, unapproved operations are denied in run mode.
+      'read-only': [],
+    },
     createTurn: (config, cwd, events) => new OpencodeTurn(config, cwd, events),
   },
   {
@@ -66,7 +91,7 @@ export const ENGINES: readonly EngineDescriptor[] = [
     name: 'Pi',
     command: 'pi',
     envPrefix: 'PI',
-    defaultArgs: '',
+    permissionArgs: {},
     createTurn: (config, cwd, events) => new PiTurn(config, cwd, events),
   },
 ]
@@ -76,6 +101,9 @@ export const ENGINE_PROVIDER_IDS: readonly string[] = ENGINES.map(engine => engi
 
 /** The engine used before any selection: `ENGINE_LOOP_ENGINE`, else claude. */
 export const DEFAULT_ENGINE_ID = envDefaultEngine()
+
+/** dsh sandbox modes the driver reads from the session's permission state. */
+export type SandboxModeLike = 'read-only' | 'workspace-write' | 'danger-full-access'
 
 function envDefaultEngine(env: NodeJS.ProcessEnv = process.env): string {
   const requested = env.ENGINE_LOOP_ENGINE?.trim()
@@ -92,7 +120,8 @@ export function isEngineProviderId(provider: string): boolean {
 }
 
 /**
- * Read one engine's invocation from its `ENGINE_LOOP_<PREFIX>_*` overrides.
+ * Read one engine's raw env invocation (command, args, model) without any
+ * permission derivation.
  * @param engineId - provider id of the engine.
  * @param env - environment to read; defaults to the process environment.
  */
@@ -107,9 +136,34 @@ export function engineConfigFromEnv(
   const model = env[`ENGINE_LOOP_${prefix}_MODEL`]?.trim()
   return {
     command: command === undefined || command === '' ? (engine?.command ?? engineId) : command,
-    extraArgs: (args ?? engine?.defaultArgs ?? '').split(/\s+/).filter(Boolean),
+    extraArgs: (args ?? '').split(/\s+/).filter(Boolean),
     ...(model === undefined || model === '' ? {} : { model }),
   }
+}
+
+/**
+ * Resolve one engine's invocation for a session turn: the env command and
+ * model pins, plus permission flags derived from the session's durable
+ * sandbox mode. An explicit `ENGINE_LOOP_<PREFIX>_ARGS` override replaces the
+ * permission derivation entirely — the caller pinned the CLI surface.
+ * @param engineId - provider id of the engine.
+ * @param sandbox - the session's `permissions` projection sandbox knob, or
+ *   null when the log never overrode it (the composition default applies).
+ * @param env - environment to read; defaults to the process environment.
+ */
+export function engineConfigForSession(
+  engineId: string,
+  sandbox: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): EngineHarnessConfig {
+  const config = engineConfigFromEnv(engineId, env)
+  const engine = ENGINES.find(candidate => candidate.id === engineId)
+  if (env[`ENGINE_LOOP_${engine?.envPrefix ?? engineId.toUpperCase()}_ARGS`] !== undefined) {
+    return config
+  }
+  const mode = sandbox === null || sandbox === undefined || sandbox === '' ? DEFAULT_SANDBOX : sandbox
+  const permission = engine?.permissionArgs[mode as SandboxModeLike]
+  return { ...config, extraArgs: [...(permission ?? []), ...config.extraArgs] }
 }
 
 /** Back-compat alias for the phase-② claude env config. */

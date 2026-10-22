@@ -77,7 +77,7 @@ import {
   DEFAULT_ENGINE_ID,
   ENGINE_DEFAULT_MODEL,
   ENGINES,
-  engineConfigFromEnv,
+  engineConfigForSession,
   isEngineProviderId,
 } from './engines.ts'
 
@@ -646,6 +646,20 @@ export class ExternalAgent implements Agent {
   }
 
   /**
+   * Read the session's durable sandbox mode from the `permissions`
+   * projection, when registered. Read through a structural cast: the
+   * projection key belongs to a package this driver does not depend on.
+   * @returns the last `sandbox/mode` override, or null before one (the
+   *   composition default, workspace-write, then applies downstream).
+   */
+  private sandboxMode(): string | null {
+    const projections = this.ctx.sessionProjections as unknown as {
+      stateOf(session: Session, key: 'permissions'): { readonly sandbox: string | null } | undefined
+    }
+    return projections.stateOf(this.session, 'permissions')?.sandbox ?? null
+  }
+
+  /**
    * Log one request envelope for the turn's effective route. The
    * `request/header` event retires a pending model selection exactly as the
    * default loop's request does (the session-controller folds it), and the
@@ -979,7 +993,7 @@ export class ExternalAgent implements Agent {
     const engineId = isEngineProviderId(this.engineProviderId)
       ? this.engineProviderId
       : DEFAULT_ENGINE_ID
-    const engineConfig = engineConfigFromEnv(engineId)
+    const engineConfig = engineConfigForSession(engineId, this.sandboxMode())
     if (pendingSelection !== null && pendingSelection !== undefined) {
       this.engineModelFlag = pendingSelection.model === ENGINE_DEFAULT_MODEL
         ? null
