@@ -23,6 +23,7 @@ import type {
   TurnBoundaryProjection,
 } from '@deepseek-ai/dsh-agent'
 import { errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { Scope } from '@deepseek-ai/dsh-scope'
 import { interruptedTurnClosers, SessionLogOffset, SessionPreparation, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -214,7 +215,7 @@ interface StoredSession {
 
 /** Prepared-but-unpublished agent resources sharing one memoized teardown. */
 interface PreparedAgent {
-  agent: ReactLoopAgent
+  agent: AgentDriver
   /** Aborts when the factory unloads, the caller cancels, or teardown begins — ends any setup await. */
   signal: AbortSignal
   /** Enter both registries and await creation listeners. */
@@ -222,6 +223,14 @@ interface PreparedAgent {
   /** Reverse teardown: stop the machine, unregister, unwind the scope. Memoized. */
   dispose(): Promise<void>
 }
+
+/**
+ * The driver {@link AgentLoop.prepare} wires: one live Agent plus the
+ * agent-scoped registration boundary its lifecycle owner unwinds after the
+ * driver exits. A replacement engine satisfies this contract without
+ * reproducing the loop's scheduler internals.
+ */
+export type AgentDriver = Agent & { readonly scope: Scope }
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -489,6 +498,25 @@ export class AgentLoop extends Service implements AgentFactory {
   }
 
   /**
+   * Construct one agent driver. The default builds the in-process React loop;
+   * a subclass overrides ONLY this to replace the driving engine while keeping
+   * the factory's ownership, publication, and teardown wiring intact.
+   * @param loopCtx - the factory's runtime context the driver registers through.
+   * @param id - shared agent/session identity.
+   * @param options - concrete loop options.
+   * @param session - the prepared session the driver owns.
+   * @returns the unpublished driver and its agent-scoped registration boundary.
+   */
+  protected createDriver(
+    loopCtx: Context,
+    id: SessionId,
+    options: AgentOptions,
+    session: Session,
+  ): AgentDriver {
+    return new ReactLoopAgent(loopCtx, id, options, session)
+  }
+
+  /**
    * Construct the driver, scope, and one memoized reverse teardown for a new
    * agent. The teardown is registered with the factory and the owner fiber
    * BEFORE publication, so a mid-setup unload rolls everything back; `signal`
@@ -532,7 +560,7 @@ export class AgentLoop extends Service implements AgentFactory {
     callerSignal?.addEventListener('abort', onCallerAbort, { once: true })
     this.ownership.signal.addEventListener('abort', onFactoryTeardown, { once: true })
 
-    let machine: ReactLoopAgent | undefined
+    let machine: AgentDriver | undefined
     let detachSession: (() => void) | undefined
     let detachAgent: (() => void) | undefined
     let disposing: Promise<void> | undefined
@@ -599,9 +627,16 @@ export class AgentLoop extends Service implements AgentFactory {
       }
     }
     const untrack = this.ownership.track(dispose)
+    // Bound before the lifecycle effect: its generator body has no `this`.
+    const createDriver = (
+      ctx: Context,
+      sessionId: SessionId,
+      agentOptions: AgentOptions,
+      driverSession: Session,
+    ): AgentDriver => this.createDriver(ctx, sessionId, agentOptions, driverSession)
     try {
       unfollowOwner = ownerCtx.effect(function* () {
-        const created = machine = new ReactLoopAgent(loopCtx, id, options, session)
+        const created = machine = createDriver(loopCtx, id, options, session)
         machineReady.resolve()
         // Adopt the scope on its original fiber so it cannot unload before teardown.
         // A loop already unloading during minting owns the provisional scope itself.

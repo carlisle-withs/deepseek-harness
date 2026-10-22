@@ -370,6 +370,7 @@
       "@deepseek-ai/dsh-agent-default-model": ["./packages/core/agent-default-model/src"],
       "@deepseek-ai/dsh-agent-instructions": ["./packages/context/agent-instructions/src"],
       "@deepseek-ai/dsh-agent-loop": ["./packages/core/agent-loop/src"],
+      "@deepseek-ai/dsh-agent-loop-external": ["./packages/core/agent-loop-external/src"],
       "@deepseek-ai/dsh-agent-loop-testkit": ["./packages/test-support/agent-loop-testkit/src"],
       "@deepseek-ai/dsh-agent-preset": ["./packages/preset/agent-preset/src"],
       "@deepseek-ai/dsh-agent-preset-registry": ["./packages/preset/agent-preset-registry/src"],

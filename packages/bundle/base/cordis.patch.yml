@@ -507,9 +507,11 @@
         personaPrefix: ''
 
     # Agents created at startup. The base stays empty; raw overlays may create
-    # agents, while Web creates sessions on client request.
+    # agents, while Web creates sessions on client request. The row swaps the
+    # default in-process loop for the external-harness driver (Phase ①: canned
+    # engine); the id and config stay identical so overlays keep applying.
     - id: agent-loop
-      name: '@deepseek-ai/dsh-agent-loop'
+      name: '@deepseek-ai/dsh-agent-loop-external'
       config:
         agents: []
 
