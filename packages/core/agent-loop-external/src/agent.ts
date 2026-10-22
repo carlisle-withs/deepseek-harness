@@ -7,10 +7,20 @@
  * Phase ②: the engine is the Claude Code CLI bridge (./claude.ts and
  * {@link ExternalAgent.runExternalHarness}) — one `claude -p
  * --output-format stream-json` child per turn whose deltas stream live into
- * `agent/assistant-stream` frames and whose internal rounds settle as
- * durable assistant messages, tool calls, results, and usage. Durable inbox
- * routing is real since Phase ①: pending input round-trips
- * `agent/inbox/spliced` events exactly like the default loop's inbox.
+ * `agent/assistant-stream` frames and whose internal rounds settle as durable
+ * assistant messages, tool calls, results, and usage. Each engine round opens
+ * one durable step (`step/start` … `step/end`), matching the default loop's
+ * turn/step/message structure the chat projection consumes; the final
+ * tool-less round defers its commit to the terminal `result` event so its
+ * message carries the turn's usage. Durable inbox routing is real since
+ * Phase ①: pending input round-trips `agent/inbox/spliced` events exactly
+ * like the default loop's inbox.
+ *
+ * Model selection: each turn reads the session-controller's durable
+ * `modelSelection` projection (pending user pick first), logs one
+ * `request/header`/`request/context` pair that retires it, and passes the
+ * chosen model to the CLI as `--model` (ENGINE_LOOP_CLAUDE_MODEL still pins
+ * the engine model above every selection).
  *
  * @module dsh-agent-loop-external/agent
  */
@@ -32,7 +42,9 @@ import {
   AssistantStreamAccumulator,
   BlockAssembler,
   LlmAttemptId,
+  ReasoningEffortId,
   ToolCallId,
+  callConfigEquals,
   createAssistantMessage,
   createToolResultMessage,
 } from '@deepseek-ai/dsh-llm'
@@ -40,7 +52,13 @@ import type { AssistantStreamRecord, ContentBlock, StreamChunk, TokenUsage } fro
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Session, SessionId, SessionSeq, TurnEndReason, UserMessage } from '@deepseek-ai/dsh-session'
+import type {
+  Session,
+  SessionId,
+  SessionSeq,
+  TurnEndReason,
+  UserMessage,
+} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import {
   ClaudeCodeTurn,
@@ -61,12 +79,18 @@ type Phase =
   }
   | { kind: 'running'; abort: AbortController; turn: number; wakeRequested: boolean }
 
-/**
- * The single logical step number every external turn records. The external
- * engine owns its own internal progress; the dsh log keeps one step per turn
- * so existing turn/step readers see a well-formed boundary sequence.
- */
-const HARNESS_STEP = 1
+/** One durable model selection, as the session-controller projection stores it. */
+interface ModelSelectionLike {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+/** Loose shape of the `modelSelection` projection state owned by the session controller. */
+interface ModelSelectionStateLike {
+  lastUsed: ModelSelectionLike | null
+  pending: ModelSelectionLike | null
+}
 
 /**
  * Copy one cancel cause into the JSON-safe shape `turn/end` records. The live
@@ -120,9 +144,9 @@ function turnUsage(usage: ClaudeTurnUsage): TokenUsage {
 const TOOL_RESULT_MISSING = 'Error: external harness ended the turn before the tool result arrived'
 
 /**
- * One claude internal model round folded as one live assistant attempt:
- * compact stream accumulation, block assembly, and the same
- * `agent/assistant-stream` frame sequence one default-loop step publishes.
+ * One claude internal model round folded as one live assistant attempt inside
+ * its own durable step: compact stream accumulation, block assembly, and the
+ * same `agent/assistant-stream` frame sequence one default-loop step publishes.
  */
 class RoundAttempt {
   private readonly accumulator = new AssistantStreamAccumulator()
@@ -136,6 +160,7 @@ class RoundAttempt {
   constructor(
     readonly attemptId: LlmAttemptId,
     private readonly turn: number,
+    readonly step: number,
     private readonly nextRevision: () => number,
     private readonly emit: (frame: AssistantStreamFrame) => void,
   ) {}
@@ -152,7 +177,7 @@ class RoundAttempt {
       attemptId: this.attemptId,
       revision: this.nextRevision(),
       turn: this.turn,
-      step: HARNESS_STEP,
+      step: this.step,
     })
   }
 
@@ -540,16 +565,15 @@ export class ExternalAgent implements Agent {
     const turn = phase.turn + 1
     this.session.append('turn/start', { turn })
     phase.turn = turn
+    /** The turn's open step; 0 before the first step opens. */
+    const steps = { current: 0 }
     let turnEnds: TurnEndReason | null = null
     try {
       const messages = this.claimTurnInput(turn)
-      for (const message of messages) {
-        this.session.append('user/message', message, { surfaceOp: 'append' })
-      }
       if (messages.length > 0) {
         signal.throwIfAborted()
         const prompt = messages.map(messageText).join('\n')
-        await this.runExternalHarness(prompt, turn, signal)
+        await this.runExternalHarness(prompt, turn, messages, steps, signal)
         signal.throwIfAborted()
       }
       turnEnds = { kind: 'completed' }
@@ -563,7 +587,7 @@ export class ExternalAgent implements Agent {
         kind: 'error',
         error: { message: error instanceof Error ? error.message : String(error), code: 'UNKNOWN' },
       }
-      this.dispatch.emit('agent/error', { turn, step: HARNESS_STEP, error })
+      this.dispatch.emit('agent/error', { turn, step: steps.current, error })
       throw error
     } finally {
       // oxlint-disable-next-line typescript/no-non-null-assertion -- every exit assigns a turn ending
@@ -573,53 +597,129 @@ export class ExternalAgent implements Agent {
   }
 
   /**
+   * Read the session-controller's durable model-selection intent, when its
+   * projection is registered. Read through a structural cast: the
+   * `modelSelection` projection key belongs to a package this driver does not
+   * depend on, so its state type is not merged into our compile-time table.
+   * @returns the pending user selection first, else the last used one.
+   */
+  private pendingModelSelection(): ModelSelectionLike | undefined {
+    const projections = this.ctx.sessionProjections as unknown as {
+      stateOf(session: Session, key: 'modelSelection'): ModelSelectionStateLike | undefined
+    }
+    const state = projections.stateOf(this.session, 'modelSelection')
+    return state?.pending ?? state?.lastUsed ?? undefined
+  }
+
+  /**
+   * Log one request envelope for the turn's effective route. The
+   * `request/header` event retires a pending model selection exactly as the
+   * default loop's request does (the session-controller folds it), and the
+   * `request/context` snapshot feeds route-aware UI.
+   * @param provider - effective provider route.
+   * @param model - effective model id.
+   * @param reasoningEffort - adapter-owned effort from the selection, if any.
+   */
+  private appendRequestEnvelope(provider: string, model: string, reasoningEffort?: string): void {
+    const config = {
+      provider,
+      model,
+      ...reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(reasoningEffort) },
+    }
+    const baseline = this.session.requestHeader()
+    if (baseline === undefined) {
+      this.session.append('request/header', { header: { config }, reason: 'initial' })
+    } else if (!callConfigEquals(baseline.config, config)) {
+      this.session.append('request/header', { header: { config }, reason: 'change' })
+    }
+    const previous = this.session.requestContext()
+    if (previous?.provider !== provider || previous.model !== model) {
+      this.session.append('request/context', { provider, model })
+    }
+  }
+
+  /**
    * Run one prompt through the external Claude Code CLI harness, streaming
    * the reply into the durable log as it arrives.
    *
    * One spawned child (`claude -p --output-format stream-json
    * --include-partial-messages --verbose`, prompt on stdin, `--resume` of the
-   * captured claude session on later turns) owns the turn. Each internal
-   * claude model round folds into one durable `assistant/message` carrying
-   * its compact embedded stream, published with live
-   * `agent/assistant-stream` frames — the exact durable and live shapes one
-   * default-loop step produces — followed by `tool/call` events for its
-   * tool_use blocks; claude's tool_result messages become `tool/result`
-   * events citing their calls. The final tool-less round stays open until
-   * the terminal `result` event so its message carries the turn's usage. On
-   * abort or harness failure the streamed prefix settles as an interrupted
-   * `assistant/message` (or an `assistant/attempt` when nothing streamed),
-   * and tool calls without their engine result close with synthetic error
-   * results, so the turn closes durably exactly like a cancelled
-   * default-loop step.
+   * captured claude session on later turns) owns the turn. The turn's claimed
+   * input enters step 1 (`step/start`, `user/message`), then each internal
+   * claude model round opens its own step and folds into one durable
+   * `assistant/message` carrying its compact embedded stream, published with
+   * live `agent/assistant-stream` frames — the exact durable and live shapes
+   * one default-loop step produces. Rounds that request tools commit inside
+   * their step, followed by `tool/call` events and claude's `tool_result`
+   * messages as `tool/result` events citing their calls; the final tool-less
+   * round defers its commit to the terminal `result` event so its message
+   * carries the turn's usage. On abort or harness failure the streamed prefix
+   * settles as an interrupted `assistant/message` (or an `assistant/attempt`
+   * when nothing streamed), and tool calls without their engine result close
+   * with synthetic error results, so the turn closes durably exactly like a
+   * cancelled default-loop step.
    *
    * TODO(external-loop): thinking deltas currently join the same attempt as
    * reasoning chunks; a UI-facing reasoning presentation pass is deferred.
    * @param prompt - the turn's claimed input text.
    * @param turn - the open turn number.
+   * @param messages - the turn's claimed input, appended as step 1's user messages.
+   * @param steps - the turn's mutable open-step holder, for error reporting.
    * @param signal - the turn's abort signal.
    */
-  protected async runExternalHarness(prompt: string, turn: number, signal: AbortSignal): Promise<void> {
+  protected async runExternalHarness(
+    prompt: string,
+    turn: number,
+    messages: readonly UserMessage[],
+    steps: { current: number },
+    signal: AbortSignal,
+  ): Promise<void> {
     const nextRevision = (): number => ++this.streamRevision
     const emitFrame = (frame: AssistantStreamFrame): void => {
       this.dispatch.emit('agent/assistant-stream', { frame })
     }
     /** The round currently receiving claude deltas; undefined between rounds. */
     let round: RoundAttempt | undefined
-    /** A finished tool-less round held open for the result event's usage. */
+    /** A finished tool-less round deferring its commit to the result event. */
     let held: RoundAttempt | undefined
-    /** Committed tool/call seqs still awaiting their claude tool_result. */
-    const openCalls = new Map<ToolCallId, SessionSeq>()
+    /** The turn's open step; 0 before the first step opens. */
+    let openStep = 0
+    /** Rounds already begun in this turn; the first reuses the initial step. */
+    let roundsStarted = 0
+    /** Committed tool/call seqs and steps still awaiting their claude tool_result. */
+    const openCalls = new Map<ToolCallId, { seq: SessionSeq; step: number }>()
 
     const modelSource = (): { provider: string; model: string } => ({
       provider: this.options.provider ?? 'claude-code',
       model: this.engineModel ?? this.options.model ?? 'claude-code',
     })
 
+    const openNextStep = (): number => {
+      // Close the current step before the next opens, mirroring the default
+      // loop's per-request step boundary (and retiring the web fold's
+      // retained transient rows before the next attempt's start frame).
+      if (openStep > 0) this.session.append('step/end', { turn, step: openStep })
+      openStep += 1
+      this.session.append('step/start', { turn, step: openStep })
+      steps.current = openStep
+      return openStep
+    }
+
     const pushChunk = (chunk: StreamChunk): void => {
       if (round === undefined) {
+        // A new engine round: settle the previous round's deferred commit and
+        // open the next step BEFORE this round's first live frame, so the web
+        // fold never sees a start frame while a settlement is still retained.
+        const previous = held
+        held = undefined
+        if (previous !== undefined) commitAssistant(previous, previous.blocks(), {})
+        roundsStarted += 1
         const attempt = new RoundAttempt(
           LlmAttemptId(`${this.id}:${++this.attemptCounter}`),
           turn,
+          // The turn's first round runs in the step already opened for the
+          // claimed input; every later round opens its own step.
+          roundsStarted === 1 ? openStep : openNextStep(),
           nextRevision,
           emitFrame,
         )
@@ -653,7 +753,7 @@ export class ExternalAgent implements Agent {
     ): void => {
       attempt.settle('assistant/message', () => this.session.append('assistant/message', {
         turn,
-        step: HARNESS_STEP,
+        step: attempt.step,
         message: createAssistantMessage({ content, source: modelSource() }),
         stream: attempt.stream,
         ...extra.interrupted === undefined ? {} : { interrupted: extra.interrupted },
@@ -661,8 +761,16 @@ export class ExternalAgent implements Agent {
       }, { surfaceOp: 'append' }).seq)
     }
 
+    /** Commit the deferred tool-less round; the next round supersedes it. */
+    const flushHeld = (): void => {
+      const previous = held
+      held = undefined
+      if (previous !== undefined) commitAssistant(previous, previous.blocks(), {})
+    }
+
     /** Fold one complete claude assistant message into durable events. */
     const commitRound = (content: readonly ClaudeContentBlock[]): void => {
+      if (round === undefined) flushHeld()
       if (round !== undefined && !round.deltaStreamed) {
         // Whole-message fallback: without partial deltas (flag dropped, older
         // CLI) synthesize the round's chunks so the durable embedded stream
@@ -690,9 +798,6 @@ export class ExternalAgent implements Agent {
       const requestsTools = content.some(block => block.type === 'tool_use')
       attempt.push({ type: 'finish', reason: requestsTools ? { kind: 'tool-calls' } : { kind: 'stop' } })
       if (!requestsTools) {
-        // The final tool-less round stays open until the result event so its
-        // assistant/message can carry the turn's usage.
-        if (held !== undefined) commitAssistant(held, held.blocks(), {})
         held = attempt
         return
       }
@@ -702,29 +807,29 @@ export class ExternalAgent implements Agent {
         if (block.type !== 'tool-call') continue
         const callSeq = this.session.append('tool/call', {
           turn,
-          step: HARNESS_STEP,
+          step: attempt.step,
           callId: block.id,
           name: block.name,
           arguments: block.arguments,
         }).seq
-        openCalls.set(block.id, callSeq)
+        openCalls.set(block.id, { seq: callSeq, step: attempt.step })
       }
     }
 
     const commitToolResult = (callId: string, text: string, isError: boolean): void => {
       const id = ToolCallId(callId)
-      const callSeq = openCalls.get(id)
-      if (callSeq === undefined) return // a result without a committed call carries no durable pair
+      const open = openCalls.get(id)
+      if (open === undefined) return // a result without a committed call carries no durable pair
       openCalls.delete(id)
       this.session.append('tool/result', {
         turn,
-        step: HARNESS_STEP,
+        step: open.step,
         message: createToolResultMessage({
           callId: id,
           content: [{ type: 'text', text }],
           isError,
         }),
-      }, { surfaceOp: 'append', sourceEventSeqs: [callSeq] })
+      }, { surfaceOp: 'append', sourceEventSeqs: [open.seq] })
     }
 
     /** Settle whatever streamed but never committed as an interrupted prefix. */
@@ -741,7 +846,7 @@ export class ExternalAgent implements Agent {
           live.settle('assistant/attempt', () =>
             this.session.append('assistant/attempt', {
               turn,
-              step: HARNESS_STEP,
+              step: live.step,
               stream: live.stream,
             }).seq)
         }
@@ -751,22 +856,39 @@ export class ExternalAgent implements Agent {
 
     /** Close committed calls whose engine result can no longer arrive. */
     const closeOpenCalls = (): void => {
-      for (const [callId, callSeq] of [...openCalls]) {
+      for (const [callId, { seq, step }] of [...openCalls]) {
         openCalls.delete(callId)
         this.session.append('tool/result', {
           turn,
-          step: HARNESS_STEP,
+          step,
           message: createToolResultMessage({
             callId,
             content: [{ type: 'text', text: TOOL_RESULT_MISSING }],
             isError: true,
           }),
-        }, { surfaceOp: 'append', sourceEventSeqs: [callSeq] })
+        }, { surfaceOp: 'append', sourceEventSeqs: [seq] })
       }
     }
 
+    // Effective route for this turn: the env pin above everything, then the
+    // durable user selection, then the agent options; the request envelope
+    // retires a pending selection and the model flag drives the CLI child.
+    const selection = this.pendingModelSelection()
+    const provider = selection?.provider ?? this.options.provider ?? 'claude-code'
+    const modelFlag = this.harnessConfig.model ?? selection?.model ?? this.options.model
+    const headerModel = modelFlag ?? this.engineModel ?? 'claude-code'
+
+    // Step 1 opens before the claimed input joins the surface, matching the
+    // default loop's step boundary ordering.
+    openNextStep()
+    for (const message of messages) {
+      this.session.append('user/message', message, { surfaceOp: 'append' })
+    }
+    this.appendRequestEnvelope(provider, headerModel, selection?.reasoningEffort)
+    signal.throwIfAborted()
+
     const harness = this.harness = new ClaudeCodeTurn(
-      this.harnessConfig,
+      { ...this.harnessConfig, ...modelFlag === undefined ? {} : { model: modelFlag } },
       this.session.header.cwd ?? process.cwd(),
       {
         onSessionId: (sessionId) => { this.engineSessionId = sessionId },
@@ -780,28 +902,37 @@ export class ExternalAgent implements Agent {
         onToolResult: commitToolResult,
       },
     )
-    const outcome = await harness.start(prompt, this.engineSessionId)
-    this.harness = undefined
-    if (signal.aborted || outcome.interrupted) {
-      settleInterrupted()
+    try {
+      const outcome = await harness.start(prompt, this.engineSessionId)
+      this.harness = undefined
+      if (signal.aborted || outcome.interrupted) {
+        settleInterrupted()
+        closeOpenCalls()
+        signal.throwIfAborted()
+        throw new Error(
+          `external harness interrupted (${outcome.subtype}): ${outcome.stderrTail.trim()}`,
+        )
+      }
+      if (outcome.subtype !== 'success') {
+        settleInterrupted()
+        closeOpenCalls()
+        throw new Error(
+          `external harness failed (${outcome.subtype}): ${outcome.text || outcome.stderrTail.trim()}`,
+        )
+      }
+      // The turn's terminal round settles now, carrying the engine's usage.
+      const finalRound = held
+      held = undefined
+      if (finalRound !== undefined) {
+        commitAssistant(
+          finalRound,
+          finalRound.blocks(),
+          outcome.usage === null ? {} : { usage: turnUsage(outcome.usage) },
+        )
+      }
       closeOpenCalls()
-      signal.throwIfAborted()
-      throw new Error(
-        `external harness interrupted (${outcome.subtype}): ${outcome.stderrTail.trim()}`,
-      )
+    } finally {
+      if (openStep > 0) this.session.append('step/end', { turn, step: openStep })
     }
-    if (outcome.subtype !== 'success') {
-      settleInterrupted()
-      closeOpenCalls()
-      throw new Error(
-        `external harness failed (${outcome.subtype}): ${outcome.text || outcome.stderrTail.trim()}`,
-      )
-    }
-    const finished = held
-    held = undefined
-    if (finished !== undefined) {
-      commitAssistant(finished, finished.blocks(), outcome.usage === null ? {} : { usage: turnUsage(outcome.usage) })
-    }
-    closeOpenCalls()
   }
 }
