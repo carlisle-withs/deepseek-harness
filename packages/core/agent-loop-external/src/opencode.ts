@@ -112,16 +112,15 @@ export class OpencodeTurn extends JsonlProcessTurn {
       const state = typeof record['state'] === 'object' && record['state'] !== null
         ? record['state'] as EngineRecord
         : {}
-      const callId = `opencode:${id}`
+      const callId = asString(record['id']) ?? asString(record['partID']) ?? 'tool'
       if (!this.seenTools.has(callId)) {
         this.seenTools.add(callId)
         const tool = asString(state['tool']) ?? 'tool'
         const input = state['input'] ?? state
-        this.events.onToolUseDelta(this.indexOf(id), callId, tool, safeJson(input))
+        this.events.onToolUseDelta(this.indexOf(callId), callId, tool, safeJson(input))
       }
-      // TODO(external-loop): the driver cannot commit mid-round tool calls
-      // without an engine message boundary, so opencode tool results are not
-      // durable pairs yet; the part's completion only reaches the live stream.
+      // A completed part pairs its call durably: the driver commits the live
+      // round as a tool round on the first result, then records this result.
       if ((state['status'] === 'completed' || state['status'] === 'error') && !this.completedTools.has(callId)) {
         this.completedTools.add(callId)
         const output = state['output']

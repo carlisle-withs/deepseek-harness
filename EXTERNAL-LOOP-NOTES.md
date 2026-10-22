@@ -68,9 +68,17 @@
   （这次差点被骗：三个"通过"的运行其实全是 claude）。验证时查引擎自己的
   数据目录（~/.claude/projects、~/.pi/agent/sessions、
   ~/.local/share/opencode）有没有新会话才算数。
-- **坑：pi 的 turn_end 会原样重复最后一条 message_end** —— 必须按内容去重
-  （message_start 清 guard，边界比较 lastReportedContent），否则一条回复落两条。
-- 已知边界（阶段④）：pi 的工具结果、opencode 的工具调用/结果还不是持久
-  配对（引擎无消息边界时无法中途提交 tool/call）；引擎错误文本会正常显示。
-- 三引擎 E2E 实测通过（claude=glm-5.3 via BigModel、pi=GLM、opencode=Flint），
-  request/header 分别为 provider=claude-code/pi/opencode。
+- **坑：pi 的 turn_end 会原样重复最后一条 message_end** —— 修复历经三版：
+  ①内容序列化去重（不可靠：重复事件里 arguments 的键序可能不同，导致同一
+  消息被报两次、同 id 的 tool/call 落两条）；②turn_end 只做 usage 捕获、
+  完全不报告（正解：message_end 一定先于 turn_end 报告同一条消息）。
+  另外 pi 的 turn_end 是**每次迭代**都发（一条 assistant 消息 = 一个 pi turn），
+  真正的终态事件是 `agent_settled`（{aborted}），不要在 turn_end 上 finish。
+- **坑：pi 会跨轮复用同一个 call id**（相同工具+参数 → 相同 id）——驱动的
+  openCalls 必须是**按 id 排队的队列**（每条结果配队首未决调用），不是
+  Map<id, entry>。opencode 新版 `run --format json` 是干净的 step 协议：
+  `tool_use` 事件自带 call+input+output+status（调用与结果同一事件），
+  `step_finish` 带每轮 tokens —— 驱动在"未知 id 的结果但活跃 round 含该
+  调用"时先 commitLiveToolRound（把活跃 round 按工具轮落盘），再配结果。
+- 工具链路现状：三引擎的 tool/call + tool/result 配对全部实测通过
+  （claude=Bash、pi=bash、opencode=glob/shell），错误结果 isError 正确标记。

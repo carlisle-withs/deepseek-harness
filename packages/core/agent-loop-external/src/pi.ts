@@ -3,10 +3,13 @@
  * the shared {@link JsonlProcessTurn} shell. Pi's stream folds naturally into
  * the claude event vocabulary: `message_update` deltas stream live, each
  * complete assistant `message_end` is one internal model round (its content
- * blocks normalize to text / thinking / tool_use), and `turn_end` settles the
- * terminal outcome with the turn's usage. Pi echoes the prompt back as a
- * `user` message before the assistant reply, so role tracking rides
- * `message_start`; text without a known role is never projected.
+ * blocks normalize to text / thinking / tool_use), tool results arrive as
+ * `toolResult`-role messages, and `agent_settled` settles the terminal
+ * outcome — pi runs one assistant message per its own turn and repeats that
+ * message at each `turn_end`; those repeats are ignored, since the boundary
+ * already reported the message. Pi echoes the prompt back as a `user`
+ * message before the assistant reply, so role tracking rides `message_start`;
+ * text without a known role is never projected.
  *
  * Env overrides: `ENGINE_LOOP_PI_COMMAND`, `ENGINE_LOOP_PI_ARGS`,
  * `ENGINE_LOOP_PI_MODEL`.
@@ -36,12 +39,6 @@ export class PiTurn extends JsonlProcessTurn {
   /** Whether any text delta streamed; whole-text fallbacks run once otherwise. */
   private streamedText = false
   private lastUsage: EngineRecord | null = null
-  /**
-   * Serialized content of the last reported assistant message: pi repeats the
-   * final message at both `message_end` and `turn_end`, and re-reporting it
-   * would fold one reply into two durable rounds.
-   */
-  private lastReportedContent: string | null = null
 
   constructor(
     config: EngineHarnessConfig,
@@ -77,16 +74,27 @@ export class PiTurn extends JsonlProcessTurn {
       }
       case 'message_start':
         this.currentRole = asString((this.messageOf(event))['role']) ?? null
-        // A fresh message start clears the repeat guard, so two genuinely
-        // identical consecutive messages both report.
-        this.lastReportedContent = null
         return
       case 'message_update':
         this.consumeUpdate(event)
         return
       case 'message_end':
-      case 'turn_end':
         this.consumeMessageBoundary(event)
+        return
+      case 'turn_end':
+        // turn_end only repeats its turn's final message_end (identical
+        // content, sometimes reshuffled argument keys); reporting here would
+        // fold one reply into two durable rounds.
+        this.captureUsage(event)
+        return
+      case 'agent_settled':
+        this.finish({
+          subtype: event['aborted'] === true ? 'interrupted' : 'success',
+          text: '',
+          sessionId: this.sessionId,
+          usage: this.lastUsage === null ? null : this.turnUsage(this.lastUsage),
+          interrupted: this.stopped || event['aborted'] === true,
+        })
         return
       case 'error':
         this.finish(this.errorOutcome(asString(event['message']) ?? 'pi error'))
@@ -134,12 +142,28 @@ export class PiTurn extends JsonlProcessTurn {
     this.captureUsage(event)
   }
 
-  /** Complete one message round, and settle the outcome at the turn boundary. */
+  /** Complete one message round, settle tool results, and end the turn. */
   private consumeMessageBoundary(event: EngineRecord): void {
-    // TODO(external-loop): pi's tool-result messages are not surfaced yet;
-    // committed tool calls without an engine result close with the driver's
-    // synthetic missing-result error.
     const message = this.messageOf(event)
+    if (message['role'] === 'toolResult') {
+      // One executed tool: the message carries its call id, text content, and
+      // error flag, pairing the round's committed tool/call durably.
+      const callId = asString(message['toolCallId'])
+      if (callId !== undefined) {
+        const content = message['content']
+        const text = Array.isArray(content)
+          ? content.map((part) => {
+            const text = typeof part === 'object' && part !== null
+              ? (part as EngineRecord)['text']
+              : undefined
+            return typeof text === 'string' ? text : ''
+          }).join('\n')
+          : ''
+        this.events.onToolResult(callId, text, message['isError'] === true)
+      }
+      this.captureUsage(event)
+      return
+    }
     if (message['role'] !== 'assistant') {
       this.captureUsage(event)
       return
@@ -163,25 +187,9 @@ export class PiTurn extends JsonlProcessTurn {
           })
         }
       }
-      // turn_end repeats the final message_end unchanged; report each
-      // distinct message exactly once as one durable round.
-      const serialized = JSON.stringify(blocks)
-      if (serialized !== this.lastReportedContent) {
-        this.lastReportedContent = serialized
-        this.events.onAssistantMessage(blocks)
-      }
+      this.events.onAssistantMessage(blocks)
     }
     this.captureUsage(event)
-    if (event['type'] === 'turn_end') {
-      const usage = this.lastUsage
-      this.finish({
-        subtype: 'success',
-        text: '',
-        sessionId: this.sessionId,
-        usage: usage === null ? null : this.turnUsage(usage),
-        interrupted: this.stopped,
-      })
-    }
   }
 
   /** Keep the freshest usage snapshot of the turn. */

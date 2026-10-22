@@ -710,8 +710,13 @@ export class ExternalAgent implements Agent {
     let openStep = 0
     /** Rounds already begun in this turn; the first reuses the initial step. */
     let roundsStarted = 0
-    /** Committed tool/call seqs and steps still awaiting their engine result. */
-    const openCalls = new Map<ToolCallId, { seq: SessionSeq; step: number }>()
+    /**
+     * Committed tool/call entries still awaiting their engine result, queued
+     * per call id: engines may reuse one id across rounds (pi re-invokes the
+     * same tool with the same id), so each result pairs with the oldest
+     * unsettled call carrying its id.
+     */
+    const openCalls = new Map<ToolCallId, { seq: SessionSeq; step: number }[]>()
 
     const modelSource = (): { provider: string; model: string } => ({
       provider: engineId,
@@ -828,24 +833,51 @@ export class ExternalAgent implements Agent {
       }
       const blocks = attempt.blocks()
       commitAssistant(attempt, blocks, {})
+      enqueueToolCalls(blocks, attempt.step)
+    }
+
+    /** Queue one committed tool-call block's durable pairing entry. */
+    const enqueueToolCalls = (blocks: readonly ContentBlock[], step: number): void => {
       for (const block of blocks) {
         if (block.type !== 'tool-call') continue
         const callSeq = this.session.append('tool/call', {
           turn,
-          step: attempt.step,
+          step,
           callId: block.id,
           name: block.name,
           arguments: block.arguments,
         }).seq
-        openCalls.set(block.id, { seq: callSeq, step: attempt.step })
+        const queue = openCalls.get(block.id)
+        if (queue === undefined) openCalls.set(block.id, [{ seq: callSeq, step }])
+        else queue.push({ seq: callSeq, step })
       }
+    }
+
+    /**
+     * Commit the live streamed round as a tool round. Engines without message
+     * boundaries (opencode) stream tool-call chunks into one open round; the
+     * first completed result proves the engine finished that round, so its
+     * call commit happens here, exactly where a boundary-reporting engine
+     * (claude, pi) commits inside `commitRound`.
+     */
+    const commitLiveToolRound = (): void => {
+      const attempt = round
+      if (attempt === undefined) return
+      round = undefined
+      attempt.push({ type: 'finish', reason: { kind: 'tool-calls' } })
+      const blocks = attempt.blocks()
+      commitAssistant(attempt, blocks, {})
+      enqueueToolCalls(blocks, attempt.step)
     }
 
     const commitToolResult = (callId: string, text: string, isError: boolean): void => {
       const id = ToolCallId(callId)
-      const open = openCalls.get(id)
+      // A result for a call streamed into the live round (an engine without
+      // message boundaries) closes that round first so the pair is durable.
+      if (round !== undefined && round.hasToolCall(id)
+        && (openCalls.get(id)?.length ?? 0) === 0) commitLiveToolRound()
+      const open = openCalls.get(id)?.shift()
       if (open === undefined) return // a result without a committed call carries no durable pair
-      openCalls.delete(id)
       this.session.append('tool/result', {
         turn,
         step: open.step,
@@ -881,17 +913,19 @@ export class ExternalAgent implements Agent {
 
     /** Close committed calls whose engine result can no longer arrive. */
     const closeOpenCalls = (): void => {
-      for (const [callId, { seq, step }] of [...openCalls]) {
+      for (const [callId, queue] of [...openCalls]) {
         openCalls.delete(callId)
-        this.session.append('tool/result', {
-          turn,
-          step,
-          message: createToolResultMessage({
-            callId,
-            content: [{ type: 'text', text: TOOL_RESULT_MISSING }],
-            isError: true,
-          }),
-        }, { surfaceOp: 'append', sourceEventSeqs: [seq] })
+        for (const { seq, step } of queue) {
+          this.session.append('tool/result', {
+            turn,
+            step,
+            message: createToolResultMessage({
+              callId,
+              content: [{ type: 'text', text: TOOL_RESULT_MISSING }],
+              isError: true,
+            }),
+          }, { surfaceOp: 'append', sourceEventSeqs: [seq] })
+        }
       }
     }
 
