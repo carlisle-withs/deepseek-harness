@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-agent-loop-external",
-  "description": "External-harness agent loop: replaces the in-process React loop driver so dsh sessions are driven by an external CLI engine (Phase 1: canned engine stub)",
+  "description": "External-harness agent loop: replaces the in-process React loop driver so dsh sessions are driven by an external CLI engine (Claude Code CLI bridge)",
   "version": "0.0.1",
   "type": "module",
   "private": true,

@@ -1,8 +1,8 @@
 /**
  * External-harness agent-loop plugin: the default `dsh-agent-loop` factory
  * with its driver replaced by {@link ExternalAgent}, which runs each turn
- * through an external CLI harness (Phase ①: canned engine stub) instead of
- * the in-process LLM React loop.
+ * through an external CLI harness (Phase ②: the Claude Code CLI bridge in
+ * ./claude.ts) instead of the in-process LLM React loop.
  *
  * Mount this package in place of `@deepseek-ai/dsh-agent-loop` (the bundle row
  * keeps id `agent-loop`); everything else — projections, registry publication,
