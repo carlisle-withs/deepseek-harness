@@ -4,9 +4,10 @@
  * the same event vocabulary the default React loop writes, so the unchanged
  * dsh UI renders external turns like native ones.
  *
- * Phase ②: the engine is the Claude Code CLI bridge (./claude.ts and
- * {@link ExternalAgent.runExternalHarness}) — one `claude -p
- * --output-format stream-json` child per turn whose deltas stream live into
+ * Phase ③: the engine registry (./engines.ts and
+ * {@link ExternalAgent.runExternalHarness}) drives one CLI child per turn —
+ * claude (`claude -p --output-format stream-json`), opencode (`opencode run
+ * --format json`), or pi (`pi --mode json -p`) — whose deltas stream live into
  * `agent/assistant-stream` frames and whose internal rounds settle as durable
  * assistant messages, tool calls, results, and usage. Each engine round opens
  * one durable step (`step/start` … `step/end`), matching the default loop's
@@ -16,14 +17,16 @@
  * Phase ①: pending input round-trips `agent/inbox/spliced` events exactly
  * like the default loop's inbox.
  *
- * Model selection: each turn reads the session-controller's durable
- * `modelSelection` projection (pending user pick first), logs one
- * `request/header`/`request/context` pair that retires it, and passes an
- * explicitly picked model to the CLI as `--model`. Without an explicit pick
- * the CLI keeps its own configured default — dsh's `AgentOptions.model`
- * (deepseek-*) is deliberately never forwarded, since the engine rejects
- * that catalog namespace with an API 400 (ENGINE_LOOP_CLAUDE_MODEL still
- * pins the engine model above every selection).
+ * Engine and model selection: each turn reads the session-controller's
+ * durable `modelSelection` projection (pending user pick first). A pick whose
+ * provider names a registered engine routes the session to that engine — the
+ * pick sticks across turns after the request envelope retires it — and its
+ * model (when not `default`) becomes the engine's model flag; without an
+ * explicit pick the CLI keeps its own configured default. dsh's
+ * `AgentOptions.model` (deepseek-*) is deliberately never forwarded, since
+ * engines reject that catalog namespace with an API 400. Per-engine env pins
+ * (`ENGINE_LOOP_<PREFIX>_MODEL`) outvote every pick, and `ENGINE_LOOP_ENGINE`
+ * sets the engine used before any selection.
  *
  * @module dsh-agent-loop-external/agent
  */
@@ -63,13 +66,18 @@ import type {
   UserMessage,
 } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-projection'
+import type {
+  EngineContentBlock,
+  EngineTurnEvents,
+  EngineTurnUsage,
+} from './process-turn.ts'
 import {
-  ClaudeCodeTurn,
-  claudeConfigFromEnv,
-  type ClaudeContentBlock,
-  type ClaudeHarnessConfig,
-  type ClaudeTurnUsage,
-} from './claude.ts'
+  DEFAULT_ENGINE_ID,
+  ENGINE_DEFAULT_MODEL,
+  ENGINES,
+  engineConfigFromEnv,
+  isEngineProviderId,
+} from './engines.ts'
 
 /** Driver lifecycle: idle, a non-turn maintenance task, or one draining turn chain. */
 type Phase =
@@ -123,7 +131,7 @@ function messageText(message: UserMessage): string {
     .join('')
 }
 
-/** Serialize a claude tool input for an unstreamed tool-call chunk. */
+/** Serialize one engine tool input for an unstreamed tool-call chunk. */
 function jsonArguments(input: unknown): string {
   if (input === undefined || input === null) return '{}'
   try {
@@ -133,8 +141,8 @@ function jsonArguments(input: unknown): string {
   }
 }
 
-/** Map claude's disjoint token counts into the session usage shape. */
-function turnUsage(usage: ClaudeTurnUsage): TokenUsage {
+/** Map an engine's disjoint token counts into the session usage shape. */
+function turnUsage(usage: EngineTurnUsage): TokenUsage {
   return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
@@ -337,20 +345,28 @@ export class ExternalAgent implements Agent {
   /** Attached-session-local attempt counter, mirroring the default loop's ids. */
   private attemptCounter = 0
   /** The external harness child behind the running turn; `cancel()` stops it. */
-  private harness: ClaudeCodeTurn | undefined
-  /** Claude session identity captured at init; later turns `--resume` it instead of resending context. */
-  private engineSessionId: string | null = null
-  /** Model id claude reported at init, for assistant attribution. */
-  private engineModel: string | null = null
+  private harness: { stop(): void } | undefined
+  /**
+   * Engine thread identity per engine, captured at each turn's init; a later
+   * turn resumes its own engine's thread instead of resending context.
+   */
+  private readonly engineSessionIds = new Map<string, string>()
+  /**
+   * Engine selected for this session: an explicit pick (provider id) sticks
+   * across turns after the request envelope retires it; before any pick the
+   * `ENGINE_LOOP_ENGINE` default (claude) applies.
+   */
+  private engineProviderId: string = DEFAULT_ENGINE_ID
+  /** Model each engine reported at init, for assistant attribution. */
+  private readonly engineModels = new Map<string, string>()
   /**
    * Last explicit user model pick (`modelSelection.pending`), kept driving the
-   * CLI child on later turns after the request envelope retires it. Never
+   * engine child on later turns after the request envelope retires it. Never
    * seeded from `AgentOptions.model`: that id lives in dsh's catalog namespace
    * (deepseek-*), which the engine rejects with an API 400.
    */
   private engineModelFlag: string | null = null
-  /** Harness invocation resolved once per agent from `ENGINE_LOOP_CLAUDE_*`. */
-  private readonly harnessConfig: ClaudeHarnessConfig = claudeConfigFromEnv()
+  /** Harness invocation resolved per turn from the selected engine's env overrides. */
 
   constructor(
     private readonly loopCtx: Context,
@@ -647,25 +663,25 @@ export class ExternalAgent implements Agent {
   }
 
   /**
-   * Run one prompt through the external Claude Code CLI harness, streaming
-   * the reply into the durable log as it arrives.
+   * Run one prompt through the selected external CLI engine, streaming the
+   * reply into the durable log as it arrives.
    *
-   * One spawned child (`claude -p --output-format stream-json
-   * --include-partial-messages --verbose`, prompt on stdin, `--resume` of the
-   * captured claude session on later turns) owns the turn. The turn's claimed
+   * One spawned child of the selected engine (prompt on stdin, the captured
+   * engine thread resumed on later turns) owns the turn. The turn's claimed
    * input enters step 1 (`step/start`, `user/message`), then each internal
-   * claude model round opens its own step and folds into one durable
+   * engine model round opens its own step and folds into one durable
    * `assistant/message` carrying its compact embedded stream, published with
    * live `agent/assistant-stream` frames — the exact durable and live shapes
-   * one default-loop step produces. Rounds that request tools commit inside
-   * their step, followed by `tool/call` events and claude's `tool_result`
-   * messages as `tool/result` events citing their calls; the final tool-less
-   * round defers its commit to the terminal `result` event so its message
-   * carries the turn's usage. On abort or harness failure the streamed prefix
-   * settles as an interrupted `assistant/message` (or an `assistant/attempt`
-   * when nothing streamed), and tool calls without their engine result close
-   * with synthetic error results, so the turn closes durably exactly like a
-   * cancelled default-loop step.
+   * one default-loop step produces. Engines that report message boundaries
+   * commit each round at its boundary (tool rounds commit with `tool/call`
+   * events and the engine's tool results as `tool/result` events citing their
+   * calls; the final tool-less round defers its commit to the terminal outcome
+   * so its message carries the turn's usage); engines without boundaries
+   * stream one round that commits at the terminal outcome. On abort or engine
+   * failure the streamed prefix settles as an interrupted `assistant/message`
+   * (or an `assistant/attempt` when nothing streamed), and tool calls without
+   * their engine result close with synthetic error results, so the turn closes
+   * durably exactly like a cancelled default-loop step.
    *
    * TODO(external-loop): thinking deltas currently join the same attempt as
    * reasoning chunks; a UI-facing reasoning presentation pass is deferred.
@@ -686,7 +702,7 @@ export class ExternalAgent implements Agent {
     const emitFrame = (frame: AssistantStreamFrame): void => {
       this.dispatch.emit('agent/assistant-stream', { frame })
     }
-    /** The round currently receiving claude deltas; undefined between rounds. */
+    /** The round currently receiving engine deltas; undefined between rounds. */
     let round: RoundAttempt | undefined
     /** A finished tool-less round deferring its commit to the result event. */
     let held: RoundAttempt | undefined
@@ -694,12 +710,12 @@ export class ExternalAgent implements Agent {
     let openStep = 0
     /** Rounds already begun in this turn; the first reuses the initial step. */
     let roundsStarted = 0
-    /** Committed tool/call seqs and steps still awaiting their claude tool_result. */
+    /** Committed tool/call seqs and steps still awaiting their engine result. */
     const openCalls = new Map<ToolCallId, { seq: SessionSeq; step: number }>()
 
     const modelSource = (): { provider: string; model: string } => ({
-      provider: this.options.provider ?? 'claude-code',
-      model: this.engineModel ?? this.options.model ?? 'claude-code',
+      provider: engineId,
+      model: this.engineModels.get(engineId) ?? ENGINE_DEFAULT_MODEL,
     })
 
     const openNextStep = (): number => {
@@ -738,7 +754,7 @@ export class ExternalAgent implements Agent {
     }
 
     /** Synthesize one whole-message chunk for streams without partial deltas. */
-    const synthesizeChunk = (index: number, block: ClaudeContentBlock): void => {
+    const synthesizeChunk = (index: number, block: EngineContentBlock): void => {
       if (block.type === 'text' && typeof block.text === 'string') {
         pushChunk({ type: 'text-delta', index, text: block.text })
       } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
@@ -776,11 +792,11 @@ export class ExternalAgent implements Agent {
       if (previous !== undefined) commitAssistant(previous, previous.blocks(), {})
     }
 
-    /** Fold one complete claude assistant message into durable events. */
-    const commitRound = (content: readonly ClaudeContentBlock[]): void => {
+    /** Fold one complete engine assistant message into durable events. */
+    const commitRound = (content: readonly EngineContentBlock[]): void => {
       if (round === undefined) flushHeld()
       if (round !== undefined && round.deltaStreamed) {
-        // Per-block fallback: claude omits input_json_delta for empty tool
+        // Per-block fallback: engines omit arguments deltas for empty tool
         // inputs; such a block still needs its chunk to reach assembly.
         for (const [index, block] of content.entries()) {
           if (block.type !== 'tool_use' || typeof block.id !== 'string' || block.id === '') continue
@@ -879,18 +895,32 @@ export class ExternalAgent implements Agent {
       }
     }
 
-    // Effective route for this turn: the env pin above everything, then the
-    // user's explicit durable pick, else the CLI's own configured default —
-    // never the dsh AgentOptions model, whose catalog namespace (deepseek-*)
-    // the engine rejects with an API 400. The request envelope still honors
-    // the session route (selection, then options) and retires a pending pick.
+    // Effective route for this turn: an explicit engine pick (the selection's
+    // provider naming a registered engine) sticks for the session; the env pin
+    // outvotes every pick for the model flag; without a pick the engine keeps
+    // its own configured model — never the dsh AgentOptions model, whose
+    // catalog namespace (deepseek-*) engines reject with an API 400.
     const selectionState = this.modelSelectionState()
     const selection = selectionState?.pending ?? selectionState?.lastUsed ?? undefined
-    const provider = selection?.provider ?? this.options.provider ?? 'claude-code'
-    const pickedModel = selectionState?.pending?.model
-    if (pickedModel !== undefined && pickedModel !== '') this.engineModelFlag = pickedModel
-    const modelFlag = this.harnessConfig.model ?? this.engineModelFlag ?? undefined
-    const headerModel = selection?.model ?? this.options.model ?? this.engineModel ?? 'claude-code'
+    const pendingSelection = selectionState?.pending
+    if (pendingSelection !== null && pendingSelection !== undefined
+      && isEngineProviderId(pendingSelection.provider)) {
+      this.engineProviderId = pendingSelection.provider
+    }
+    const engineId = isEngineProviderId(this.engineProviderId)
+      ? this.engineProviderId
+      : DEFAULT_ENGINE_ID
+    const engineConfig = engineConfigFromEnv(engineId)
+    if (pendingSelection !== null && pendingSelection !== undefined) {
+      this.engineModelFlag = pendingSelection.model === ENGINE_DEFAULT_MODEL
+        ? null
+        : pendingSelection.model
+    }
+    const modelFlag = engineConfig.model ?? this.engineModelFlag ?? undefined
+    const headerModel = selection?.model
+      ?? modelFlag
+      ?? this.engineModels.get(engineId)
+      ?? ENGINE_DEFAULT_MODEL
 
     // Step 1 opens before the claimed input joins the surface, matching the
     // default loop's step boundary ordering.
@@ -898,26 +928,29 @@ export class ExternalAgent implements Agent {
     for (const message of messages) {
       this.session.append('user/message', message, { surfaceOp: 'append' })
     }
-    this.appendRequestEnvelope(provider, headerModel, selection?.reasoningEffort)
+    this.appendRequestEnvelope(engineId, headerModel, selection?.reasoningEffort)
     signal.throwIfAborted()
 
-    const harness = this.harness = new ClaudeCodeTurn(
-      { ...this.harnessConfig, ...modelFlag === undefined ? {} : { model: modelFlag } },
-      this.session.header.cwd ?? process.cwd(),
-      {
-        onSessionId: (sessionId) => { this.engineSessionId = sessionId },
-        onModel: (model) => { this.engineModel = model },
-        onTextDelta: (index, text) => { pushChunk({ type: 'text-delta', index, text }) },
-        onThinkingDelta: (index, text) => { pushChunk({ type: 'reasoning-delta', index, text }) },
-        onToolUseDelta: (index, id, name, argumentsDelta) => {
-          pushChunk({ type: 'tool-call-delta', index, id: ToolCallId(id), name, argumentsDelta })
-        },
-        onAssistantMessage: commitRound,
-        onToolResult: commitToolResult,
+    const engine = ENGINES.find(candidate => candidate.id === engineId)
+    if (engine === undefined) throw new Error(`unknown external engine "${engineId}"`)
+    const events: EngineTurnEvents = {
+      onSessionId: (sessionId) => { this.engineSessionIds.set(engineId, sessionId) },
+      onModel: (model) => { this.engineModels.set(engineId, model) },
+      onTextDelta: (index, text) => { pushChunk({ type: 'text-delta', index, text }) },
+      onThinkingDelta: (index, text) => { pushChunk({ type: 'reasoning-delta', index, text }) },
+      onToolUseDelta: (index, id, name, argumentsDelta) => {
+        pushChunk({ type: 'tool-call-delta', index, id: ToolCallId(id), name, argumentsDelta })
       },
+      onAssistantMessage: commitRound,
+      onToolResult: commitToolResult,
+    }
+    const harness = this.harness = engine.createTurn(
+      { ...engineConfig, ...modelFlag === undefined ? {} : { model: modelFlag } },
+      this.session.header.cwd ?? process.cwd(),
+      events,
     )
     try {
-      const outcome = await harness.start(prompt, this.engineSessionId)
+      const outcome = await harness.start(prompt, this.engineSessionIds.get(engineId) ?? null)
       this.harness = undefined
       if (signal.aborted || outcome.interrupted) {
         settleInterrupted()
@@ -934,10 +967,20 @@ export class ExternalAgent implements Agent {
           `external harness failed (${outcome.subtype}): ${outcome.text || outcome.stderrTail.trim()}`,
         )
       }
-      // The turn's terminal round settles now, carrying the engine's usage.
-      const finalRound = held
+      // The turn's terminal round settles now, carrying the engine's usage: a
+      // deferred tool-less round when the engine reports message boundaries,
+      // else the still-live streamed round (engines without boundaries, or a
+      // stream whose boundary event was lost).
+      const deferred = held
+      const live = round
       held = undefined
+      round = undefined
+      const finalRound = deferred ?? live
       if (finalRound !== undefined) {
+        if (live !== undefined && deferred === undefined) {
+          // A live round never received its boundary event; close its stream.
+          live.push({ type: 'finish', reason: { kind: 'stop' } })
+        }
         commitAssistant(
           finalRound,
           finalRound.blocks(),

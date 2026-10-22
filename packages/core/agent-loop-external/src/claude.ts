@@ -1,9 +1,10 @@
 /**
  * Claude Code CLI bridge: one spawned `claude -p --output-format
  * stream-json` child per external turn, translating its JSONL event stream
- * into driver callbacks. Turn continuity rides the CLI's own session
- * persistence — the first turn captures `session_id` from `system/init`,
- * later turns pass `--resume <id>` so prior context is never re-sent.
+ * into driver callbacks over the shared {@link JsonlProcessTurn} shell. Turn
+ * continuity rides the CLI's own session persistence — the first turn
+ * captures `session_id` from `system/init`, later turns pass `--resume <id>`
+ * so prior context is never re-sent.
  *
  * The parsing logic is ported from the engine-shim prototype (battle-tested
  * against Claude Code 2.x). The invocation is env-overridable via
@@ -13,15 +14,20 @@
  * @module dsh-agent-loop-external/claude
  */
 
-import { type ChildProcess, spawn } from 'node:child_process'
-import { createInterface } from 'node:readline'
+import type {
+  EngineContentBlock,
+  EngineHarnessConfig,
+  EngineRecord,
+  EngineTurnEvents,
+  EngineTurnOutcome,
+  EngineTurnUsage,
+} from './process-turn.ts'
+import { JsonlProcessTurn } from './process-turn.ts'
 
-/** One parsed JSONL record, already narrowed to an object. */
-type JsonRecord = Record<string, unknown>
-
-function asRecord(value: unknown): JsonRecord | undefined {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as JsonRecord : undefined
-}
+export type ClaudeContentBlock = EngineContentBlock
+export type ClaudeTurnEvents = EngineTurnEvents
+export type ClaudeTurnOutcome = EngineTurnOutcome
+export type ClaudeTurnUsage = EngineTurnUsage
 
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
@@ -32,93 +38,15 @@ function asIndex(value: unknown): number {
   return Number.isSafeInteger(index) && index >= 0 ? index : -1
 }
 
-/** How to invoke the external claude CLI. */
-export interface ClaudeHarnessConfig {
-  /** Executable name or path; resolved through the shell on Windows. */
-  command: string
-  /** Extra arguments appended after the fixed streaming flags. */
-  extraArgs: readonly string[]
-  /** `--model` override, omitted when absent. */
-  model?: string
-}
-
-/**
- * Read the harness invocation from `ENGINE_LOOP_CLAUDE_*` overrides.
- * @param env - environment to read; defaults to the process environment.
- * @returns the resolved invocation with sensible defaults.
- */
-export function claudeConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ClaudeHarnessConfig {
-  const model = env.ENGINE_LOOP_CLAUDE_MODEL?.trim()
-  return {
-    command: env.ENGINE_LOOP_CLAUDE_COMMAND?.trim() || 'claude',
-    extraArgs: (env.ENGINE_LOOP_CLAUDE_ARGS ?? '--permission-mode acceptEdits')
-      .split(/\s+/)
-      .filter(Boolean),
-    ...(model === undefined || model === '' ? {} : { model }),
-  }
-}
-
-/** Loose JSON shape of one claude assistant content block. */
-export interface ClaudeContentBlock {
-  readonly type: string
-  readonly text?: string
-  readonly thinking?: string
-  readonly id?: string
-  readonly name?: string
-  readonly input?: unknown
-}
-
-/** Content blocks of one claude assistant message, already narrowed. */
+/** Content blocks of one assistant message, already narrowed. */
 function contentBlocks(message: unknown): readonly ClaudeContentBlock[] {
-  const content = asRecord(message)?.['content']
+  const content = typeof message === 'object' && message !== null
+    ? (message as EngineRecord)['content']
+    : undefined
   if (!Array.isArray(content)) return []
-  return content.filter((block): block is ClaudeContentBlock => asRecord(block) !== undefined)
+  return content.filter((block): block is ClaudeContentBlock =>
+    typeof block === 'object' && block !== null && !Array.isArray(block))
 }
-
-/** Token accounting mapped from the terminal `result` event's `usage`. */
-export interface ClaudeTurnUsage {
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheWriteTokens: number
-}
-
-/** Streaming events one external turn folds into its durable log. */
-export interface ClaudeTurnEvents {
-  /** Session identity from `system/init`; the driver stores it for `--resume`. */
-  onSessionId(sessionId: string): void
-  /** Model id from `system/init`. */
-  onModel(model: string): void
-  /** One assistant text delta (`stream_event` `content_block_delta`). */
-  onTextDelta(index: number, text: string): void
-  /** One assistant thinking delta; the driver maps it to reasoning. */
-  onThinkingDelta(index: number, text: string): void
-  /** One tool-arguments JSON fragment for an open `tool_use` block. */
-  onToolUseDelta(index: number, id: string, name: string, argumentsDelta: string): void
-  /** One complete internal model round (claude `assistant` event). */
-  onAssistantMessage(content: readonly ClaudeContentBlock[]): void
-  /** One completed tool invocation (a `tool_result` block of a `user` event). */
-  onToolResult(callId: string, text: string, isError: boolean): void
-}
-
-/** Terminal outcome of one claude child, from its `result` event or exit. */
-export interface ClaudeTurnOutcome {
-  /** `success`, a claude error subtype, or a local `error_*`/`interrupted` marker. */
-  subtype: string
-  /** Final assistant text (claude `result.result`); empty on local failures. */
-  text: string
-  /** Session identity seen this turn, for a later `--resume`. */
-  sessionId: string | null
-  /** Token accounting from the `result` event, when one arrived. */
-  usage: ClaudeTurnUsage | null
-  /** Whether {@link ClaudeCodeTurn.stop} ended the child before its result. */
-  interrupted: boolean
-  /** Tail of stderr, for diagnostics on abnormal exits. */
-  stderrTail: string
-}
-
-/** The unresolved outcome fields every terminal path supplies. */
-type OutcomeInput = Omit<ClaudeTurnOutcome, 'stderrTail'>
 
 /** One accumulating `tool_use` content block between its start and stop. */
 interface BlockAccumulator {
@@ -128,40 +56,26 @@ interface BlockAccumulator {
   inputJson: string
 }
 
-/** Characters of stderr retained for failure diagnostics. */
-const STDERR_TAIL_CHARS = 2000
-
 /**
- * One live `claude -p` child. The prompt travels on stdin — a Windows shell
- * argument list cannot carry multiline text, while `claude -p` reads a piped
- * stdin as its prompt. Stdout JSONL is parsed line by line into
- * {@link ClaudeTurnEvents}; `stop()` tears down the whole process tree so a
- * cancelled turn closes immediately instead of waiting for the engine.
+ * One live `claude -p` child over the shared JSONL process shell.
  */
-export class ClaudeCodeTurn {
-  private child: ChildProcess | undefined
-  private stopped = false
-  private settled = false
-  private stderrTail = ''
-  private knownSessionId: string | null = null
-  private outcome: ClaudeTurnOutcome | undefined
+export class ClaudeCodeTurn extends JsonlProcessTurn {
   private readonly blocks = new Map<number, BlockAccumulator>()
-  private readonly done = Promise.withResolvers<ClaudeTurnOutcome>()
+  private knownSessionId: string | null = null
 
   constructor(
-    private readonly config: ClaudeHarnessConfig,
-    private readonly cwd: string,
+    config: EngineHarnessConfig,
+    cwd: string,
     private readonly events: ClaudeTurnEvents,
-  ) {}
+  ) {
+    super(config, cwd)
+  }
 
-  /**
-   * Spawn the child and run one prompt to its terminal event.
-   * @param prompt - the turn's input text, written to stdin as UTF-8.
-   * @param resumeSessionId - a captured session id to resume, or null.
-   * @returns the terminal outcome; never rejects — local failures resolve
-   *   with an `error_*` subtype.
-   */
-  start(prompt: string, resumeSessionId: string | null): Promise<ClaudeTurnOutcome> {
+  protected override get engineLabel(): string {
+    return 'claude CLI'
+  }
+
+  protected override buildCommand(resumeSessionId: string | null): { command: string; args: string[] } {
     const args = [
       '-p',
       '--output-format',
@@ -173,89 +87,10 @@ export class ClaudeCodeTurn {
     ]
     if (this.config.model !== undefined) args.push('--model', this.config.model)
     if (resumeSessionId !== null) args.push('--resume', resumeSessionId)
-    const child = this.child = spawn(this.config.command, args, {
-      cwd: this.cwd,
-      env: { ...process.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-      // The npm-installed claude is a .cmd shim only spawnable through a shell.
-      shell: process.platform === 'win32',
-    })
-    const { stdin, stdout, stderr } = child
-    stdin.on('error', () => {
-      // An early exit closes the pipe before the prompt finishes writing.
-    })
-    stdin.write(prompt, 'utf8')
-    stdin.end()
-
-    const lines = createInterface({ input: stdout, crlfDelay: Infinity })
-    lines.on('line', (line) => { this.consume(line) })
-    stderr.setEncoding('utf8')
-    stderr.on('data', (chunk: string) => {
-      this.stderrTail = (this.stderrTail + chunk).slice(-STDERR_TAIL_CHARS)
-    })
-    child.on('error', (error: Error) => {
-      this.finish({
-        subtype: 'error_local',
-        text: `claude CLI failed to start: ${error.message}`,
-        sessionId: this.knownSessionId,
-        usage: null,
-        interrupted: false,
-      })
-    })
-    child.on('close', () => {
-      this.finish({
-        subtype: this.stopped ? 'interrupted' : 'error_exit',
-        text: this.stderrTail.trim(),
-        sessionId: this.knownSessionId,
-        usage: null,
-        interrupted: this.stopped,
-      })
-      const outcome = this.outcome
-      if (outcome !== undefined) this.done.resolve(outcome)
-    })
-    return this.done.promise
+    return { command: this.config.command, args }
   }
 
-  /** Tear the child down; the awaiting {@link start} settles as interrupted. */
-  stop(): void {
-    if (this.stopped) return
-    this.stopped = true
-    const child = this.child
-    if (child === undefined || child.exitCode !== null) return
-    if (process.platform !== 'win32') {
-      child.kill()
-      return
-    }
-    // shell:true wraps the CLI in cmd.exe; killing only the wrapper orphans
-    // the engine. taskkill /T removes the whole tree, falling back to a
-    // direct kill when taskkill itself cannot start.
-    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
-      stdio: 'ignore',
-      windowsHide: true,
-    })
-    killer.on('error', () => { child.kill() })
-  }
-
-  /** Record the first terminal outcome; later candidates are dropped. */
-  private finish(outcome: OutcomeInput): void {
-    if (this.settled) return
-    this.settled = true
-    this.outcome = { ...outcome, stderrTail: this.stderrTail }
-  }
-
-  /** Parse one stdout JSONL line into turn events. */
-  private consume(line: string): void {
-    const trimmed = line.trim()
-    if (trimmed === '') return
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(trimmed)
-    } catch {
-      return // a truncated non-JSON line carries no protocol meaning
-    }
-    const event = asRecord(parsed)
-    if (event === undefined) return
+  protected override consume(event: EngineRecord): void {
     switch (event['type']) {
       case 'system': {
         if (event['subtype'] !== 'init') return
@@ -278,7 +113,9 @@ export class ClaudeCodeTurn {
         this.consumeToolResults(event['message'])
         return
       case 'result': {
-        const rawUsage = asRecord(event['usage'])
+        const rawUsage = typeof event['usage'] === 'object' && event['usage'] !== null
+          ? event['usage'] as EngineRecord
+          : undefined
         this.finish({
           subtype: asString(event['subtype']) ?? 'success',
           text: typeof event['result'] === 'string' ? event['result'] : '',
@@ -300,10 +137,14 @@ export class ClaudeCodeTurn {
 
   /** Translate one Anthropic Messages SSE event forwarded as a stream_event. */
   private consumeStreamEvent(forwarded: unknown): void {
-    const stream = asRecord(forwarded)
+    const stream = typeof forwarded === 'object' && forwarded !== null
+      ? forwarded as EngineRecord
+      : undefined
     if (stream === undefined) return
     if (stream['type'] === 'content_block_start') {
-      const block = asRecord(stream['content_block']) ?? { type: 'text' }
+      const block = typeof stream['content_block'] === 'object' && stream['content_block'] !== null
+        ? stream['content_block'] as EngineRecord
+        : { type: 'text' }
       const toolCallId = asString(block['id'])
       const toolName = asString(block['name'])
       this.blocks.set(asIndex(stream['index']), {
@@ -316,7 +157,9 @@ export class ClaudeCodeTurn {
     }
     if (stream['type'] === 'content_block_delta') {
       const index = asIndex(stream['index'])
-      const delta = asRecord(stream['delta'])
+      const delta = typeof stream['delta'] === 'object' && stream['delta'] !== null
+        ? stream['delta'] as EngineRecord
+        : undefined
       if (delta === undefined) return
       if (delta['type'] === 'text_delta' && typeof delta['text'] === 'string') {
         this.events.onTextDelta(index, delta['text'])
@@ -340,7 +183,7 @@ export class ClaudeCodeTurn {
   /** Forward each tool_result block of one claude `user` event. */
   private consumeToolResults(message: unknown): void {
     for (const block of contentBlocks(message)) {
-      const record = block as unknown as JsonRecord
+      const record = block as unknown as EngineRecord
       const callId = asString(record['tool_use_id'])
       if (record['type'] !== 'tool_result' || callId === undefined) continue
       const content = record['content']
@@ -350,7 +193,9 @@ export class ClaudeCodeTurn {
       } else if (Array.isArray(content)) {
         text = content
           .map((part) => {
-            const text = asRecord(part)?.['text']
+            const text = typeof part === 'object' && part !== null
+              ? (part as EngineRecord)['text']
+              : undefined
             return typeof text === 'string' ? text : ''
           })
           .join('\n')
