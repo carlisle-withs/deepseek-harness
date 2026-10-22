@@ -18,10 +18,14 @@
 
 import type { LlmModelInfo, LlmProviderInfo, StreamChunk, GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import type { EngineHarnessConfig, EngineTurnEvents, EngineTurnOutcome } from './process-turn.ts'
 import { ClaudeCodeTurn } from './claude.ts'
 import { PiTurn } from './pi.ts'
 import { OpencodeTurn } from './opencode.ts'
+
+const execFileAsync = promisify(execFile)
 
 /** The model id that defers model choice to the engine CLI's own configuration. */
 export const ENGINE_DEFAULT_MODEL = 'default'
@@ -36,13 +40,21 @@ interface EngineDescriptor {
   readonly command: string
   /** Env prefix for this engine's overrides (`ENGINE_LOOP_<PREFIX>_…`). */
   readonly envPrefix: string
-  /**
-   * Permission flags per dsh sandbox mode, replacing the engine's own default
+  /** Permission flags per dsh sandbox mode, replacing the engine's own default
    * permission behavior. One-shot children cannot ask, so the approval knob
    * has no mapping: `ask` collapses into each mode's least-privilege flags.
    * An omitted mode (pi) keeps the engine's own configuration.
    */
   readonly permissionArgs: Partial<Record<SandboxModeLike, readonly string[]>>
+  /**
+   * The engine's own model-list invocation: args appended to the command,
+   * with a stdout parser. Oitted engines (claude: interactive listing) offer
+   * only the `default` model in the picker.
+   */
+  readonly listModels?: {
+    readonly args: readonly string[]
+    readonly parse: (stdout: string) => readonly { id: string; name: string; provider?: string }[]
+  }
   /** Build one live engine child. */
   readonly createTurn: (
     config: EngineHarnessConfig,
@@ -84,6 +96,17 @@ export const ENGINES: readonly EngineDescriptor[] = [
       // without --auto, unapproved operations are denied in run mode.
       'read-only': [],
     },
+    // `opencode models` prints one `provider/model` id per line.
+    listModels: {
+      args: ['models'],
+      parse: stdout => stdout.split('\n')
+        .map(line => line.trim())
+        .filter(line => line.includes('/'))
+        .map((line) => {
+          const at = line.lastIndexOf('/')
+          return { id: line, name: line.slice(at + 1), provider: line.slice(0, at) }
+        }),
+    },
     createTurn: (config, cwd, events) => new OpencodeTurn(config, cwd, events),
   },
   {
@@ -92,6 +115,18 @@ export const ENGINES: readonly EngineDescriptor[] = [
     command: 'pi',
     envPrefix: 'PI',
     permissionArgs: {},
+    // `pi --list-models` prints a whitespace table: provider model context…
+    listModels: {
+      args: ['--list-models'],
+      parse: stdout => stdout.split('\n')
+        .map(line => line.trim().match(/^(\S+)\s+(\S+)\s/))
+        .filter((match): match is RegExpMatchArray => match !== null && match[1] !== 'provider')
+        .map((match) => {
+          const engineProvider = match[1] ?? ''
+          const modelId = match[2] ?? ''
+          return { id: `${engineProvider}/${modelId}`, name: modelId, provider: engineProvider }
+        }),
+    },
     createTurn: (config, cwd, events) => new PiTurn(config, cwd, events),
   },
 ]
@@ -170,18 +205,51 @@ export function engineConfigForSession(
 export const claudeConfigFromEnv = (env?: NodeJS.ProcessEnv): EngineHarnessConfig =>
   engineConfigFromEnv('claude-code', env)
 
+/** Cache lifetime for one engine's CLI model list. */
+const MODEL_LIST_TTL_MS = 60_000
+/** One model-list invocation's hard timeout. */
+const MODEL_LIST_TIMEOUT_MS = 10_000
+
 /**
  * Catalog adapter for the engine providers: lists each engine as a picker
- * group whose `default` model defers to the CLI's own configuration (an env
- * model pin also appears as a concrete selectable id). Model calls never
- * route through it — the external loop drives the CLIs directly.
+ * group whose `default` model defers to the CLI's own configuration. Engines
+ * with a model-list command (`opencode models`, `pi --list-models`) populate
+ * their real selectable ids, fetched once per TTL with a stale-while-
+ * revalidate cache and a timeout fallback to the default-only listing. Model
+ * calls never route through it — the external loop drives the CLIs directly.
  */
 export class EngineCatalogAdapter extends LlmAdapter {
+  private readonly cache = new Map<string, { at: number; models: readonly LlmModelInfo[] }>()
+  private readonly pending = new Map<string, Promise<readonly LlmModelInfo[]>>()
+
   override providerInfo(provider: string): LlmProviderInfo {
     return { id: provider, name: ENGINES.find(engine => engine.id === provider)?.name ?? provider }
   }
 
-  override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+  override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const engine = ENGINES.find(candidate => candidate.id === provider)
+    const listing = engine === undefined ? undefined : engine.listModels
+    if (engine === undefined || listing === undefined) {
+      return Promise.resolve(this.defaultModels(provider))
+    }
+    const cached = this.cache.get(provider)
+    if (cached !== undefined && Date.now() - cached.at < MODEL_LIST_TTL_MS) return cached.models
+    let pending = this.pending.get(provider)
+    if (pending === undefined) {
+      pending = this.listFromCli(provider, engine.command, listing.args, listing.parse)
+        .catch(() => this.defaultModels(provider))
+        .then((models) => {
+          this.cache.set(provider, { at: Date.now(), models })
+          return models
+        })
+      this.pending.set(provider, pending)
+      void pending.then(() => { this.pending.delete(provider) }, () => { this.pending.delete(provider) })
+    }
+    return cached?.models ?? pending
+  }
+
+  /** The always-offered fallback listing: the CLI's own default model. */
+  private defaultModels(provider: string): readonly LlmModelInfo[] {
     const pinned = engineConfigFromEnv(provider).model
     const models: LlmModelInfo[] = [
       { provider, id: ENGINE_DEFAULT_MODEL, name: '引擎默认模型' },
@@ -189,7 +257,33 @@ export class EngineCatalogAdapter extends LlmAdapter {
     if (pinned !== undefined && pinned !== ENGINE_DEFAULT_MODEL) {
       models.push({ provider, id: pinned, name: pinned })
     }
-    return Promise.resolve(models)
+    return models
+  }
+
+  /** Spawn one engine's model-list command and parse its stdout. */
+  private async listFromCli(
+    provider: string,
+    command: string,
+    args: readonly string[],
+    parse: (stdout: string) => readonly { id: string; name: string; provider?: string }[],
+  ): Promise<readonly LlmModelInfo[]> {
+    const { stdout } = await execFileAsync(command, [...args], {
+      timeout: MODEL_LIST_TIMEOUT_MS,
+      windowsHide: true,
+      // npm-installed CLIs are .cmd shims only spawnable through a shell.
+      shell: process.platform === 'win32',
+      maxBuffer: 4 * 1024 * 1024,
+    })
+    const listed = parse(stdout)
+      .filter(model => model.id !== ENGINE_DEFAULT_MODEL)
+      .map(model => ({
+        provider,
+        id: model.id,
+        name: model.name,
+        ...(model.provider === undefined ? {} : { description: model.provider }),
+      }))
+    const fallback = this.defaultModels(provider)[0]
+    return fallback === undefined ? listed : [fallback, ...listed]
   }
 
   override stream(_options: GenerateOptions): AsyncIterable<StreamChunk> {
