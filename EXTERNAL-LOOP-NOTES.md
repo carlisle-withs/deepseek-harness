@@ -82,3 +82,13 @@
   调用"时先 commitLiveToolRound（把活跃 round 按工具轮落盘），再配结果。
 - 工具链路现状：三引擎的 tool/call + tool/result 配对全部实测通过
   （claude=Bash、pi=bash、opencode=glob/shell），错误结果 isError 正确标记。
+- **坑：长工具链下 result 事件可能晚于下一轮首 delta 到达**（Obsidian 48 步
+  会话实测发生）——"下一轮首 delta 即关当前步骤"的策略会在结果落地前关步，
+  触发校验器「step/end leaves unresolved tool call」。修复=openNextStep 关步
+  前先 closeOpenCalls（对未决调用落合成结果，迟到的真实结果被丢弃）。
+  另外 settleInterrupted 中被中断轮次宣告但未启动的工具调用，用格式官方的
+  TOOL_NOT_STARTED 修复形状收尾（message.id 必须
+  `interrupted-tool-result-<callId>-<n>` + 固定文案，无 sourceEventSeqs）。
+  历史损坏会话可用根目录 repair-session.mjs 修复（把迟到 tool/result 移回
+  其 step/end 之前 + 重排 seq + 重映射引用；Obsidian 那个 202 事件会话已
+  修复成功）。scan-sessions.mjs 已补上 closeTools 规则。

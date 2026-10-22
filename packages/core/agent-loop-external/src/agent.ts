@@ -44,6 +44,8 @@ import type {
   InboxTarget,
 } from '@deepseek-ai/dsh-agent'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { MessageId } from '@deepseek-ai/dsh-llm'
 import {
   AssistantStreamAccumulator,
   BlockAssembler,
@@ -153,6 +155,14 @@ function turnUsage(usage: EngineTurnUsage): TokenUsage {
 
 /** Result text recorded for a tool call whose engine result never arrived. */
 const TOOL_RESULT_MISSING = 'Error: external harness ended the turn before the tool result arrived'
+
+/**
+ * Result text of the format's TOOL_NOT_STARTED repair — the validator admits
+ * exactly this sentence (and id shape) for a tool call an assistant message
+ * advertised but the harness never recorded as started.
+ */
+const TOOL_NOT_STARTED_TEXT
+  = 'The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.'
 
 /**
  * One claude internal model round folded as one live assistant attempt inside
@@ -726,8 +736,14 @@ export class ExternalAgent implements Agent {
     const openNextStep = (): number => {
       // Close the current step before the next opens, mirroring the default
       // loop's per-request step boundary (and retiring the web fold's
-      // retained transient rows before the next attempt's start frame).
-      if (openStep > 0) this.session.append('step/end', { turn, step: openStep })
+      // retained transient rows before the next attempt's start frame). The
+      // format requires every step's tool calls to settle before its step
+      // closes, and an engine may interleave the next round's deltas ahead of
+      // a pending result line — so still-open calls close synthetically here.
+      if (openStep > 0) {
+        closeOpenCalls()
+        this.session.append('step/end', { turn, step: openStep })
+      }
       openStep += 1
       this.session.append('step/start', { turn, step: openStep })
       steps.current = openStep
@@ -899,6 +915,25 @@ export class ExternalAgent implements Agent {
         const content = live.interruptedBlocks()
         if (content.length > 0) {
           commitAssistant(live, content, { interrupted: true })
+          // Tool calls an interrupted round advertised but never started have
+          // no tool/call to pair; the format's TOOL_NOT_STARTED repair shape
+          // settles them without one.
+          for (const block of content) {
+            if (block.type !== 'tool-call') continue
+            this.session.append('tool/result', {
+              turn,
+              step: live.step,
+              message: {
+                id: brandString<MessageId>(`interrupted-tool-result-${block.id}-0`),
+                role: 'tool',
+                source: { kind: 'tool', callId: block.id },
+                toolCallId: block.id,
+                content: [{ type: 'text', text: TOOL_NOT_STARTED_TEXT }],
+                isError: true,
+              },
+              error: { name: 'ToolNotStartedError', code: 'TOOL_NOT_STARTED' },
+            }, { surfaceOp: 'append' })
+          }
         } else {
           live.settle('assistant/attempt', () =>
             this.session.append('assistant/attempt', {
