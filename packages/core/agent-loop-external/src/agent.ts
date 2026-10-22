@@ -18,9 +18,12 @@
  *
  * Model selection: each turn reads the session-controller's durable
  * `modelSelection` projection (pending user pick first), logs one
- * `request/header`/`request/context` pair that retires it, and passes the
- * chosen model to the CLI as `--model` (ENGINE_LOOP_CLAUDE_MODEL still pins
- * the engine model above every selection).
+ * `request/header`/`request/context` pair that retires it, and passes an
+ * explicitly picked model to the CLI as `--model`. Without an explicit pick
+ * the CLI keeps its own configured default — dsh's `AgentOptions.model`
+ * (deepseek-*) is deliberately never forwarded, since the engine rejects
+ * that catalog namespace with an API 400 (ENGINE_LOOP_CLAUDE_MODEL still
+ * pins the engine model above every selection).
  *
  * @module dsh-agent-loop-external/agent
  */
@@ -339,6 +342,13 @@ export class ExternalAgent implements Agent {
   private engineSessionId: string | null = null
   /** Model id claude reported at init, for assistant attribution. */
   private engineModel: string | null = null
+  /**
+   * Last explicit user model pick (`modelSelection.pending`), kept driving the
+   * CLI child on later turns after the request envelope retires it. Never
+   * seeded from `AgentOptions.model`: that id lives in dsh's catalog namespace
+   * (deepseek-*), which the engine rejects with an API 400.
+   */
+  private engineModelFlag: string | null = null
   /** Harness invocation resolved once per agent from `ENGINE_LOOP_CLAUDE_*`. */
   private readonly harnessConfig: ClaudeHarnessConfig = claudeConfigFromEnv()
 
@@ -597,18 +607,16 @@ export class ExternalAgent implements Agent {
   }
 
   /**
-   * Read the session-controller's durable model-selection intent, when its
+   * Read the session-controller's durable model-selection state, when its
    * projection is registered. Read through a structural cast: the
    * `modelSelection` projection key belongs to a package this driver does not
    * depend on, so its state type is not merged into our compile-time table.
-   * @returns the pending user selection first, else the last used one.
    */
-  private pendingModelSelection(): ModelSelectionLike | undefined {
+  private modelSelectionState(): ModelSelectionStateLike | undefined {
     const projections = this.ctx.sessionProjections as unknown as {
       stateOf(session: Session, key: 'modelSelection'): ModelSelectionStateLike | undefined
     }
-    const state = projections.stateOf(this.session, 'modelSelection')
-    return state?.pending ?? state?.lastUsed ?? undefined
+    return projections.stateOf(this.session, 'modelSelection')
   }
 
   /**
@@ -771,12 +779,7 @@ export class ExternalAgent implements Agent {
     /** Fold one complete claude assistant message into durable events. */
     const commitRound = (content: readonly ClaudeContentBlock[]): void => {
       if (round === undefined) flushHeld()
-      if (round !== undefined && !round.deltaStreamed) {
-        // Whole-message fallback: without partial deltas (flag dropped, older
-        // CLI) synthesize the round's chunks so the durable embedded stream
-        // matches the committed blocks.
-        for (const [index, block] of content.entries()) synthesizeChunk(index, block)
-      } else if (round !== undefined) {
+      if (round !== undefined && round.deltaStreamed) {
         // Per-block fallback: claude omits input_json_delta for empty tool
         // inputs; such a block still needs its chunk to reach assembly.
         for (const [index, block] of content.entries()) {
@@ -791,6 +794,12 @@ export class ExternalAgent implements Agent {
             argumentsDelta: jsonArguments(block.input),
           })
         }
+      } else {
+        // Whole-message fallback: no delta reached this round — a synthetic
+        // engine message (API error) or a CLI without partial streaming — and
+        // `round` may not even exist yet, so synthesize one chunk per block to
+        // create the attempt and keep the durable stream equal to the blocks.
+        for (const [index, block] of content.entries()) synthesizeChunk(index, block)
       }
       const attempt = round
       round = undefined
@@ -871,12 +880,17 @@ export class ExternalAgent implements Agent {
     }
 
     // Effective route for this turn: the env pin above everything, then the
-    // durable user selection, then the agent options; the request envelope
-    // retires a pending selection and the model flag drives the CLI child.
-    const selection = this.pendingModelSelection()
+    // user's explicit durable pick, else the CLI's own configured default —
+    // never the dsh AgentOptions model, whose catalog namespace (deepseek-*)
+    // the engine rejects with an API 400. The request envelope still honors
+    // the session route (selection, then options) and retires a pending pick.
+    const selectionState = this.modelSelectionState()
+    const selection = selectionState?.pending ?? selectionState?.lastUsed ?? undefined
     const provider = selection?.provider ?? this.options.provider ?? 'claude-code'
-    const modelFlag = this.harnessConfig.model ?? selection?.model ?? this.options.model
-    const headerModel = modelFlag ?? this.engineModel ?? 'claude-code'
+    const pickedModel = selectionState?.pending?.model
+    if (pickedModel !== undefined && pickedModel !== '') this.engineModelFlag = pickedModel
+    const modelFlag = this.harnessConfig.model ?? this.engineModelFlag ?? undefined
+    const headerModel = selection?.model ?? this.options.model ?? this.engineModel ?? 'claude-code'
 
     // Step 1 opens before the claimed input joins the surface, matching the
     // default loop's step boundary ordering.
